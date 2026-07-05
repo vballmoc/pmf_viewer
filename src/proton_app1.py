@@ -3,6 +3,15 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import pandas as pd
 
+# At the TOP of your script (after imports):
+if 'reset_counter' not in st.session_state:
+    st.session_state.reset_counter = 0
+
+# Replace your reset button:
+if st.sidebar.button("🔄 Reset to Defaults"):
+    st.session_state.reset_counter += 1  # Force widget re-creation
+    st.rerun()
+    
 # Custom styling
 st.markdown("""
 <style>

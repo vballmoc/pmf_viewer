@@ -4,6 +4,10 @@ import streamlit as st
 import pandas as pd
 from io import StringIO
 
+# At the TOP of your script (after imports, before any widgets):
+if 'reset_counter' not in st.session_state:
+    st.session_state.reset_counter = 0
+
 # Custom styling
 st.markdown("""
 <style>
@@ -53,6 +57,7 @@ st.title("Ion transport across a membrane: Δψ changes faster than ΔpH")
 
 # Reset button
 if st.sidebar.button("🔄 Reset to Defaults"):
+    st.session_state.reset_counter += 1
     st.rerun()
 
 # Key Concepts expander
@@ -66,105 +71,136 @@ with st.expander("🔑 **Key Concepts**", expanded=False):
     """)
 
 
+# -----------------------------
 # Sidebar parameters with tooltips
+# -----------------------------
 st.sidebar.header("Vesicle and solution")
 radius_nm = st.sidebar.slider(
     "Vesicle radius / nm",
     25, 1000, 100, step=25,
-    help="Typical liposomes: 50–200 nm. Smaller vesicles reach steady-state faster."
+    help="Typical liposomes: 50–200 nm. Smaller vesicles reach steady-state faster.",
+    key=f"radius_nm_{st.session_state.reset_counter}"
 )
 capacitance_uF_cm2 = st.sidebar.slider(
     "Membrane capacitance / µF cm⁻²",
     0.2, 2.0, 1.0, step=0.1,
-    help="Higher capacitance = more charge storage per voltage."
+    help="Higher capacitance = more charge storage per voltage.",
+    key=f"capacitance_{st.session_state.reset_counter}"
 )
 pH_initial = st.sidebar.slider(
     "Initial pH inside",
     5.0, 9.0, 7.0, step=0.1,
-    help="Starting pH inside the vesicle."
+    help="Starting pH inside the vesicle.",
+    key=f"pH_initial_{st.session_state.reset_counter}"
 )
 buffer_mM = st.sidebar.slider(
     "Soluble buffer concentration / mM",
     0.0, 200.0, 50.0, step=5.0,
-    help="Higher buffer = more resistance to pH changes."
+    help="Higher buffer = more resistance to pH changes.",
+    key=f"buffer_mM_{st.session_state.reset_counter}"
 )
 buffer_pKa = st.sidebar.slider(
     "Soluble buffer pKa",
     5.0, 9.0, 7.5, step=0.1,
-    help="pKa of the soluble buffer. Buffer works best near its pKa."
+    help="pKa of the soluble buffer. Buffer works best near its pKa.",
+    key=f"buffer_pKa_{st.session_state.reset_counter}"
 )
 
 st.sidebar.header("Membrane buffering")
 include_membrane_buffer = st.sidebar.checkbox(
     "Include membrane/headgroup buffering",
     value=True,
-    help="Account for proton binding to lipid headgroups."
+    help="Account for proton binding to lipid headgroups.",
+    key=f"membrane_buffer_{st.session_state.reset_counter}"
 )
 lipid_area_nm2 = st.sidebar.slider(
     "Area per lipid / nm²",
     0.4, 1.0, 0.7, step=0.05,
-    help="Smaller area = more lipids per vesicle."
+    help="Smaller area = more lipids per vesicle.",
+    key=f"lipid_area_{st.session_state.reset_counter}"
 )
 buffering_lipid_fraction = st.sidebar.slider(
     "Fraction of titratable inner leaflet lipids",
     0.0, 1.0, 0.25, step=0.05,
-    help="Fraction of lipids that can bind/release protons."
+    help="Fraction of lipids that can bind/release protons.",
+    key=f"lipid_fraction_{st.session_state.reset_counter}"
 )
 headgroup_pKa = st.sidebar.slider(
     "Headgroup apparent pKa",
     3.0, 9.0, 6.5, step=0.1,
-    help="pKa of lipid headgroups. Typically 3–7 for phospholipids."
+    help="pKa of lipid headgroups. Typically 3–7 for phospholipids.",
+    key=f"headgroup_pKa_{st.session_state.reset_counter}"
 )
 
 st.sidebar.header("Proton pump")
 pump_rate_max = st.sidebar.slider(
     "Maximum pump rate / H⁺ s⁻¹",
     1, 5000, 1000, step=10,
-    help="Maximum protons pumped per second."
+    help="Maximum protons pumped per second.",
+    key=f"pump_rate_{st.session_state.reset_counter}"
 )
 deltaG_pump_kJ_mol = st.sidebar.slider(
     "Pump driving energy / kJ mol⁻¹ H⁺",
     2.0, 30.0, 15.0, step=0.5,
-    help="Energy driving the pump. Higher = stronger pumping."
+    help="Energy driving the pump. Higher = stronger pumping.",
+    key=f"pump_energy_{st.session_state.reset_counter}"
 )
 pump_steepness_mV = st.sidebar.slider(
     "Pump slowdown width / mV",
     1.0, 50.0, 10.0, step=1.0,
-    help="How sharply the pump slows near its stopping potential."
+    help="How sharply the pump slows near its stopping potential.",
+    key=f"pump_steepness_{st.session_state.reset_counter}"
 )
 duration_s = st.sidebar.slider(
     "Simulation time / s",
     0.1, 120.0, 20.0, step=0.1,
-    help="Total duration of the simulation."
+    help="Total duration of the simulation.",
+    key=f"duration_{st.session_state.reset_counter}"
 )
 direction = st.sidebar.radio(
     "Direction",
     ["pump H⁺ into vesicle", "pump H⁺ out of vesicle"],
     index=0,
-    help="Direction of proton pumping."
+    help="Direction of proton pumping.",
+    key=f"direction_{st.session_state.reset_counter}"
 )
 
 st.sidebar.header("Membrane leak")
 leak_conductance = st.sidebar.slider(
     "Leak conductance above threshold / H⁺ s⁻¹ mV⁻¹",
     0.0, 50.0, 5.0, step=0.5,
-    help="How strongly the leak dissipates Δψ above the threshold."
+    help="How strongly the leak dissipates Δψ above the threshold.",
+    key=f"leak_cond_{st.session_state.reset_counter}"
 )
 leak_threshold_mV = st.sidebar.slider(
     "Soft leak threshold / mV",
     0.0, 200.0, 40.0, step=5.0,
-    help="Δψ at which leakiness starts to increase."
+    help="Δψ at which leakiness starts to increase.",
+    key=f"leak_threshold_{st.session_state.reset_counter}"
 )
 leak_softness_mV = st.sidebar.slider(
     "Softness of leak onset / mV",
     1.0, 50.0, 10.0, step=1.0,
-    help="Width of the transition from no leak to full leak."
+    help="Width of the transition from no leak to full leak.",
+    key=f"leak_softness_{st.session_state.reset_counter}"
 )
 
 st.sidebar.header("Display")
-show_fluxes = st.sidebar.checkbox("Show pump and leak fluxes", value=True)
-show_absolute_pH = st.sidebar.checkbox("Also show absolute internal pH", value=False)
-show_leak_curve = st.sidebar.checkbox("Show leak curve", value=True)
+show_fluxes = st.sidebar.checkbox(
+    "Show pump and leak fluxes",
+    value=True,
+    key=f"show_fluxes_{st.session_state.reset_counter}"
+)
+show_absolute_pH = st.sidebar.checkbox(
+    "Also show absolute internal pH",
+    value=False,
+    key=f"show_abs_pH_{st.session_state.reset_counter}"
+)
+show_leak_curve = st.sidebar.checkbox(
+    "Show leak curve",
+    value=True,
+    key=f"show_leak_{st.session_state.reset_counter}"
+)
 
 # Helper function: soft-threshold leak
 def soft_threshold_leak(psi_mV, conductance, threshold_mV, softness_mV):
