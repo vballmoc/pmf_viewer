@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 from io import StringIO
 from scipy.integrate import solve_ivp
+from version_info import show_version
 
 st.set_page_config(page_title="Ion transport: Δψ vs ΔpH", layout="wide")
 
@@ -55,32 +56,7 @@ F = 96485.33212  # C/mol
 NA = 6.02214076e23  # mol^-1
 
 
-# -----------------------------
-# Version indicator (read from git, so it updates with every commit)
-# -----------------------------
-@st.cache_data(ttl=30)  # refresh every 30 s, so slider moves don't call git each time
-def get_version_info(app_path):
-    import os, subprocess, datetime
-    app_dir = os.path.dirname(os.path.abspath(app_path))
-
-    def git(*args):
-        return subprocess.run(["git", "-C", app_dir, *args], capture_output=True,
-                              text=True, timeout=5, check=True).stdout.strip()
-    try:
-        commit, date = git("log", "-1", "--format=%h|%cd", "--date=format:%Y-%m-%d %H:%M").split("|")
-        branch = git("rev-parse", "--abbrev-ref", "HEAD")
-        changed = git("status", "--porcelain", "--", os.path.abspath(app_path))
-        text = f"Version {commit} · {date} · branch {branch}"
-        if changed:
-            text += " · ✏️ with local changes, not yet committed"
-        return text
-    except Exception:
-        # No git available: fall back to the file's last modification time
-        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(app_path))
-        return f"File last modified {mtime:%Y-%m-%d %H:%M}"
-
-
-st.sidebar.caption(get_version_info(__file__))
+show_version(__file__)  # version line in the sidebar (see version_info.py)
 
 st.title("Ion transport across a membrane: Δψ changes faster than ΔpH")
 

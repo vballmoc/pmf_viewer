@@ -2,6 +2,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+from version_info import show_version
 
 # ------------------------------------------------------------
 # Educational model:
@@ -18,6 +19,7 @@ import streamlit as st
 # ------------------------------------------------------------
 
 st.set_page_config(page_title="Liposome protein reconstitution", layout="wide")
+show_version(__file__)  # version line in the sidebar (see version_info.py)
 
 st.title("Protein reconstitution into liposomes")
 
@@ -143,6 +145,7 @@ def binomial_pmf_for_orientation(n, p):
     ])
 
 
+@st.cache_data(max_entries=20)  # rerun only when a simulation input changes
 def simulate_reconstitution(
     n_lipo,
     lambda_eff,
@@ -151,51 +154,68 @@ def simulate_reconstitution(
     orientation_coupling,
     seed,
 ):
+    """Same model as before, written so that most steps run as array operations.
+
+    Step 1: choose a liposome for every inserted protein, in insertion order.
+            Only with an occupied-liposome preference does this depend on earlier
+            insertions; otherwise all choices are drawn at once.
+    Step 2: assign orientations. A protein's orientation depends only on the
+            proteins inserted before it into the SAME liposome, so all first
+            proteins are handled together, then all second proteins, and so on.
+    """
     rng = np.random.default_rng(seed)
 
-    n_inserted = rng.poisson(lambda_eff * n_lipo)
+    n_inserted = int(rng.poisson(lambda_eff * n_lipo))
 
-    counts = np.zeros(n_lipo, dtype=np.int32)
     inside_out_counts = np.zeros(n_lipo, dtype=np.int32)
     inside_in_counts = np.zeros(n_lipo, dtype=np.int32)
 
     if n_inserted == 0:
-        return counts, inside_out_counts, inside_in_counts, 0
+        return np.zeros(n_lipo, dtype=np.int32), inside_out_counts, inside_in_counts, 0
 
-    occupied_indices = []
-
-    for _ in range(n_inserted):
-        use_occupied = (
-            rng.random() < occupied_preference
-            and len(occupied_indices) > 0
-        )
-
-        if use_occupied:
-            idx = occupied_indices[rng.integers(0, len(occupied_indices))]
-        else:
-            idx = rng.integers(0, n_lipo)
-
-        was_empty = counts[idx] == 0
-        counts[idx] += 1
-
-        if was_empty:
-            occupied_indices.append(idx)
-            is_inside_out = rng.random() < p_inside_out
-        else:
-            if rng.random() < orientation_coupling:
-                if inside_out_counts[idx] > inside_in_counts[idx]:
-                    is_inside_out = True
-                elif inside_in_counts[idx] > inside_out_counts[idx]:
-                    is_inside_out = False
-                else:
-                    is_inside_out = rng.random() < p_inside_out
+    # Step 1: liposome for each insertion
+    if occupied_preference == 0:
+        target = rng.integers(0, n_lipo, size=n_inserted)
+    else:
+        u_pref = rng.random(n_inserted)
+        u_pick = rng.random(n_inserted)
+        any_lipo = rng.integers(0, n_lipo, size=n_inserted)
+        target = np.empty(n_inserted, dtype=np.int64)
+        is_occupied = np.zeros(n_lipo, dtype=bool)
+        occupied_indices = []
+        for i in range(n_inserted):
+            if u_pref[i] < occupied_preference and occupied_indices:
+                idx = occupied_indices[int(u_pick[i] * len(occupied_indices))]
             else:
-                is_inside_out = rng.random() < p_inside_out
+                idx = any_lipo[i]
+                if not is_occupied[idx]:
+                    is_occupied[idx] = True
+                    occupied_indices.append(idx)
+            target[i] = idx
 
-        if is_inside_out:
-            inside_out_counts[idx] += 1
+    counts = np.bincount(target, minlength=n_lipo).astype(np.int32)
+
+    # Step 2: rank of each protein within its liposome (0 = first one inserted)
+    order = np.argsort(target, kind="stable")
+    sorted_target = target[order]
+    group_start = np.r_[0, np.flatnonzero(np.diff(sorted_target)) + 1]
+    group_sizes = np.diff(np.r_[group_start, n_inserted])
+    rank = np.empty(n_inserted, dtype=np.int64)
+    rank[order] = np.arange(n_inserted) - np.repeat(group_start, group_sizes)
+
+    for r in range(int(rank.max()) + 1):
+        lipo = target[rank == r]  # each liposome appears at most once per round
+        independent = rng.random(lipo.size) < p_inside_out
+        if r == 0:
+            is_inside_out = independent
         else:
-            inside_in_counts[idx] += 1
+            follows = rng.random(lipo.size) < orientation_coupling
+            more_out = inside_out_counts[lipo] > inside_in_counts[lipo]
+            more_in = inside_in_counts[lipo] > inside_out_counts[lipo]
+            is_inside_out = np.where(follows & more_out, True,
+                                     np.where(follows & more_in, False, independent))
+        inside_out_counts[lipo] += is_inside_out
+        inside_in_counts[lipo] += ~is_inside_out
 
     return counts, inside_out_counts, inside_in_counts, n_inserted
 

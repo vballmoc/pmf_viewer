@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+from version_info import show_version
 
 # ------------------------------------------------------------
 # Educational model:
@@ -25,6 +26,7 @@ F = 96485.33212
 NA = 6.02214076e23
 
 st.set_page_config(page_title="Valinomycin Nernst clamp", layout="wide")
+show_version(__file__)  # version line in the sidebar (see version_info.py)
 
 st.title("Valinomycin as a K⁺ Nernst clamp")
 
@@ -203,6 +205,20 @@ for i in range(n_points):
 charge_flux_inside[-1] = charge_flux_inside[-2]
 K_compensating_flux[-1] = K_compensating_flux[-2]
 
+# If a fixed-direction load drains the internal K⁺ pool completely, valinomycin
+# can no longer compensate and the Nernst clamp is no longer valid. Without this,
+# the plot would show a meaningless Δψ (> 1 V) that only comes from the 1e-30 floor.
+K_exhausted = K_in_counts <= 1e-9 * K_in_counts[0]
+if K_exhausted.any():
+    t_exhausted = time[np.argmax(K_exhausted)]
+    psi_mV[K_exhausted] = np.nan
+    st.warning(
+        f"The internal K⁺ pool is used up after {t_exhausted:.1f} s. From then on, "
+        "valinomycin cannot compensate the load any more, so Δψ is no longer the K⁺ "
+        "Nernst potential and is not shown. In a real vesicle, Δψ would then be set by "
+        "the charge on the membrane capacitance, which this model does not include."
+    )
+
 after_load = time >= load_start_s
 above = np.abs(psi_mV) >= min_abs_potential_mV
 indices = np.where(after_load & above)[0]
@@ -220,7 +236,7 @@ col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Initial Δψ = E_K", f"{psi_mV[0]:+.1f} mV")
 with col2:
-    st.metric("Final Δψ = E_K", f"{psi_mV[-1]:+.1f} mV")
+    st.metric("Final Δψ = E_K", "K⁺ used up" if np.isnan(psi_mV[-1]) else f"{psi_mV[-1]:+.1f} mV")
 with col3:
     st.metric("Lifetime above threshold", lifetime_text)
 with col4:
