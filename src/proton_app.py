@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import pandas as pd
 from io import StringIO
+from scipy.integrate import solve_ivp
+
+st.set_page_config(page_title="Ion transport: Δψ vs ΔpH", layout="wide")
 
 # At the TOP of your script (after imports, before any widgets):
 if 'reset_counter' not in st.session_state:
@@ -50,8 +53,6 @@ st.markdown("""
 # Constants
 F = 96485.33212  # C/mol
 NA = 6.02214076e23  # mol^-1
-
-st.set_page_config(page_title="Ion transport: Δψ vs ΔpH", layout="wide")
 
 st.title("Ion transport across a membrane: Δψ changes faster than ΔpH")
 
@@ -237,65 +238,60 @@ beta_total = beta_soluble + beta_water + beta_membrane
 if beta_total <= 0:
     beta_total = 1e-30
 
+# -----------------------------
 # Time integration
-# Add to SIDEBAR (under "Simulation" section):
+# -----------------------------
+# The model is solved with scipy's adaptive stiff ODE solver (Radau).
+# A simple fixed-step (Euler) loop was used before; it became unstable for
+# small vesicles, strong leaks or sharp pump slowdown (Δψ oscillated and
+# turned into NaN) and overshot the pH when buffering was very weak.
 n_points = st.sidebar.slider(
     "Number of time points",
-    100, 3000, 500, step=100,
-    help="Higher = smoother curves but slower. Default: 1000."
+    100, 3000, 1000, step=100,
+    help="Number of points for plotting and CSV export. The solver picks its own "
+         "internal step size, so this does not change the accuracy.",
+    key=f"n_points_{st.session_state.reset_counter}"
 )
-
-# Then replace the old line with:
-# Time integration
-n_points = max(500, min(3000, int(duration_s * 100)))
 time = np.linspace(0, duration_s, n_points)
-dt = time[1] - time[0]
 sign = +1 if direction == "pump H⁺ into vesicle" else -1
+mV_per_proton = F / NA / C_total * 1000  # Δψ change per transported H⁺
 
-# Initialize arrays
-delta_psi_mV = np.zeros_like(time)
-delta_pH = np.zeros_like(time)
-pH_inside = np.zeros_like(time)
-pH_inside[0] = pH_initial
-net_charge_protons = np.zeros_like(time)
-pump_flux = np.zeros_like(time)
-leak_flux = np.zeros_like(time)
-mol_H_inside_change = 0.0  # Track cumulative moles of H+ added
 
-# Simulation loop with pH-dependent β
-for i in range(1, n_points):
-    psi = delta_psi_mV[i-1]
-    opposing_psi_mV = sign * psi
-
-    # Pump and leak fluxes
+def pump_flux_fn(psi_mV):
+    opposing_psi_mV = sign * psi_mV
     pump_fraction = 1.0 / (1.0 + np.exp((opposing_psi_mV - psi_stop_mV) / pump_steepness_mV))
-    pump_flux_i = sign * pump_rate_max * pump_fraction
-    leak_flux_i = soft_threshold_leak(psi, leak_conductance, leak_threshold_mV, leak_softness_mV)
-    total_flux_i = pump_flux_i + leak_flux_i
+    return sign * pump_rate_max * pump_fraction
 
-    # Incremental changes
-    delta_q_protons = total_flux_i * dt
-    delta_mol_H = delta_q_protons / NA
-    mol_H_inside_change += delta_mol_H
-    q_protons = net_charge_protons[i-1] + delta_q_protons
 
-    # Recalculate β at CURRENT pH (not initial!)
-    current_H = 10**(-pH_inside[i-1])
-    current_beta_soluble = 2.303 * C_buffer_M * Ka_buffer * current_H / (Ka_buffer + current_H)**2
-    current_beta_water = 2.303 * (current_H + Kw / current_H)
-    current_beta_total = current_beta_soluble + current_beta_water + beta_membrane
+def beta_at(pH):
+    # β recalculated at the CURRENT pH (soluble buffer and water);
+    # membrane β is evaluated at the starting pH
+    H = 10**(-pH)
+    return (2.303 * C_buffer_M * Ka_buffer * H / (Ka_buffer + H)**2
+            + 2.303 * (H + Kw / H) + beta_membrane)
 
-    # Update state variables
-    charge_C = q_protons / NA * F
-    delta_psi_mV[i] = (charge_C / C_total) * 1000
 
-    # Incremental ΔpH (correct for nonlinear β)
-    delta_pH[i] = delta_pH[i-1] - delta_mol_H / (current_beta_total * volume_L)
-    pH_inside[i] = pH_initial + delta_pH[i]
+def rhs(t, y):
+    # y[0] = net protons moved into the vesicle, y[1] = ΔpH
+    q_protons, dpH = y
+    psi = q_protons * mV_per_proton
+    flux = pump_flux_fn(psi) + soft_threshold_leak(psi, leak_conductance, leak_threshold_mV, leak_softness_mV)
+    d_dpH = -flux / NA / (beta_at(pH_initial + dpH) * volume_L)
+    return [flux, d_dpH]
 
-    net_charge_protons[i] = q_protons
-    pump_flux[i] = pump_flux_i
-    leak_flux[i] = leak_flux_i
+
+sol = solve_ivp(rhs, (0, duration_s), [0.0, 0.0], method="Radau", t_eval=time,
+                rtol=1e-7, atol=[1e-6, 1e-10])
+if not sol.success:
+    st.error(f"The solver did not finish: {sol.message}")
+    st.stop()
+
+net_charge_protons = sol.y[0]
+delta_pH = sol.y[1]
+delta_psi_mV = net_charge_protons * mV_per_proton
+pH_inside = pH_initial + delta_pH
+pump_flux = pump_flux_fn(delta_psi_mV)
+leak_flux = soft_threshold_leak(delta_psi_mV, leak_conductance, leak_threshold_mV, leak_softness_mV)
 
 pmf_mV = delta_psi_mV - 59.16 * delta_pH
 
@@ -544,7 +540,9 @@ st.markdown("""
 - The pump is represented by a simple thermodynamic slowdown, not by a detailed kinetic model.
 - The leak is phenomenological and represented by a smooth threshold function.
 - Counter-ion movement is not explicitly modelled.
-- Buffering is treated as a local linear approximation around the starting pH.
+- Soluble-buffer and water buffering are recalculated at the current internal pH; membrane buffering is evaluated at the starting pH.
 - Membrane/headgroup buffering is approximated as an effective inner-volume buffer.
+- The pump only slows down against Δψ; the back-pressure from ΔpH is not included. This matters only at low buffer capacity, where ΔpH becomes large.
+- The outside pH is assumed to stay at the starting pH, so ΔpH is the change of the internal pH.
 - The model is meant for teaching intuition, not quantitative prediction.
 """)
