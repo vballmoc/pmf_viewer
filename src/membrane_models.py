@@ -71,14 +71,24 @@ def proton_model(outer_diameter_nm=200.0, bilayer_nm=4.5, capacitance_uF_cm2=1.0
                  membrane_buffering=True, lipid_area_nm2=0.7, titratable_fraction=0.25,
                  headgroup_pKa=6.5,
                  pump_max=1000.0, pump_dG_kJ=15.0, pump_width_mV=10.0, pump_into=True,
+                 pump_off_s=None,
                  leak_conductance=5.0, leak_threshold_mV=40.0, leak_softness_mV=10.0,
+                 anion_conductance=0.0, anion_in_mM=100.0, anion_out_mM=100.0,
                  temperature_C=25.0, duration_s=20.0, n_points=1000):
+    """Proton pump with proton leak and an optional anion (counter-ion) leak.
+
+    States: net positive charge moved in (count), ΔpH, anions inside (count).
+    Protons change both Δψ and pH; anions only change Δψ. Anions move along their
+    electrochemical gradient: J_anion,in = g · (Δψ − E_anion), E_anion = RT/F · ln([A⁻]in/[A⁻]out).
+    pump_off_s: time at which the pump is switched off (None = runs throughout).
+    """
     geo = geometry(outer_diameter_nm, bilayer_nm, capacitance_uF_cm2)
     V, mVpc = geo["volume_L"], geo["mV_per_charge"]
     RT_F = nernst_factor_mV(temperature_C)
     Z = np.log(10) * RT_F                    # mV per pH unit
     stop_mV = pump_dG_kJ * 1000 / F * 1000
     s = 1.0 if pump_into else -1.0
+    A_start = anion_in_mM * 1e-3 * V * NA
 
     # headgroups on the inner leaflet, treated as an extra buffer in the lumen
     H0 = 10.0 ** (-pH_start)
@@ -90,28 +100,51 @@ def proton_model(outer_diameter_nm=200.0, bilayer_nm=4.5, capacitance_uF_cm2=1.0
     def beta(pH):
         return soluble_beta(pH, buffer_mM / 1000, buffer_pKa) + beta_membrane
 
-    def fluxes(q, dpH):
+    def fluxes(q, dpH, N_A, pump_on):
         psi = q * mVpc
         back = s * (psi - Z * dpH)           # electrochemical H⁺ gradient against the pump
-        J_pump = s * pump_rate(back, pump_max, stop_mV, pump_width_mV)
+        J_pump = s * pump_rate(back, pump_max, stop_mV, pump_width_mV) * pump_on
         J_leak = soft_leak(psi, leak_conductance, leak_threshold_mV, leak_softness_mV)
-        return psi, J_pump, J_leak
+        A_in_mM = np.maximum(N_A, 1e-9) / NA / V * 1000
+        E_A = RT_F * np.log(A_in_mM / anion_out_mM) if anion_conductance > 0 else 0.0
+        J_anion = anion_conductance * (psi - E_A)        # anions INTO the vesicle
+        return psi, J_pump, J_leak, J_anion, A_in_mM
 
-    def rhs(t, y):
-        q, dpH = y
-        _, J_pump, J_leak = fluxes(q, dpH)
-        J = J_pump + J_leak
-        return [J, -J / NA / (beta(pH_start + dpH) * V)]
+    def make_rhs(pump_on):
+        def rhs(t, y):
+            q, dpH, N_A = y
+            _, J_pump, J_leak, J_anion, _ = fluxes(q, dpH, N_A, pump_on)
+            J_H = J_pump + J_leak
+            return [J_H - J_anion, -J_H / NA / (beta(pH_start + dpH) * V), J_anion]
+        return rhs
 
     t = np.linspace(0, duration_s, n_points)
-    sol = solve_ivp(rhs, (0, duration_s), [0.0, 0.0], method="Radau", t_eval=t,
-                    rtol=1e-7, atol=[1e-6, 1e-10])
-    if not sol.success:
-        raise RuntimeError(sol.message)
-    q, dpH = sol.y
-    psi, J_pump, J_leak = fluxes(q, dpH)
+    t_off = duration_s if pump_off_s is None else min(max(pump_off_s, 0.0), duration_s)
+    atol = [1e-6, 1e-10, max(A_start, 1.0) * 1e-10]
+    y0 = [0.0, 0.0, A_start]
+    # Solve the "pump on" and "pump off" periods separately; the switch is a sudden jump.
+    # Time points before t_off belong to the first period, the rest to the second.
+    pump_runs_to_end = t_off >= duration_s
+    periods = [(0.0, t_off, 1.0, t if pump_runs_to_end else t[t < t_off])]
+    if not pump_runs_to_end:
+        periods.append((t_off, duration_s, 0.0, t[t >= t_off]))
+    pieces, on_flags = [], []
+    for a, b, on, t_eval in periods:
+        if b <= a:                                    # pump off from the start
+            continue
+        sol = solve_ivp(make_rhs(on), (a, b), y0, method="Radau", t_eval=t_eval,
+                        rtol=1e-7, atol=atol, dense_output=True)
+        if not sol.success:
+            raise RuntimeError(sol.message)
+        pieces.append(sol.y)
+        on_flags.append(np.full(sol.y.shape[1], on))
+        y0 = sol.sol(b)
+    q, dpH, N_A = np.hstack(pieces)
+    pump_on = np.concatenate(on_flags)
+    psi, J_pump, J_leak, J_anion, A_in_mM = fluxes(q, dpH, N_A, pump_on)
     return dict(time=t, psi_mV=psi, delta_pH=dpH, pH_in=pH_start + dpH,
-                pmf_mV=psi - Z * dpH, J_pump=J_pump, J_leak=J_leak,
+                pmf_mV=psi - Z * dpH, J_pump=J_pump, J_leak=J_leak, J_anion=J_anion,
+                anion_in_mM=A_in_mM, anions_in=N_A - A_start, t_pump_off=pump_off_s,
                 stop_mV=stop_mV, beta_start=beta(pH_start), beta_membrane=beta_membrane,
                 Z_mV=Z, **geo)
 

@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import membrane_models as m
-from membrane_figures import (ALERT, CSS, GRID, H_COLOR, H_LIGHT, INK, K_COLOR, K_LIGHT, MUTED,
+from membrane_figures import (ALERT, ANION_COLOR, CSS, GRID, H_COLOR, H_LIGHT, INK, K_COLOR, K_LIGHT, MUTED,
                               PH_COLOR, csv_with_header, finish, fmt_count, fmt_mV, fmt_signed,
                               fmt_time, label_line, new_axes, vesicle_pair)
 from version_info import show_version
@@ -95,37 +95,65 @@ with tab_proton:
                                     "(Δψ plus the ΔpH part) equals this energy.")
         p_w = st.number_input("Slowdown width / mV", 1.0, 50.0, 10.0, 1.0, key="p_w",
                               help="How gradually the pump slows down before it stops.")
+        p_off_on = st.checkbox("Switch the pump off during the run", value=False, key="p_off_on",
+                               help="Shows how Δψ and ΔpH decay through the leaks once the pump stops, "
+                                    "e.g. when ATP is used up.")
+        p_off = st.number_input("Pump off after / s", 0.0, 10000.0, 10.0, 1.0, key="p_off") if p_off_on else None
         group("Proton leak")
         p_g = st.number_input("Leak above threshold / H⁺ s⁻¹ mV⁻¹", 0.0, 1000.0, 5.0, 0.5, key="p_g",
                               help="Set to 0 for a perfectly tight membrane.")
         with st.expander("Leak details"):
             p_thr = st.number_input("Leak starts at |Δψ| / mV", 0.0, 300.0, 40.0, 5.0, key="p_thr")
             p_soft = st.number_input("Softness of the onset / mV", 1.0, 50.0, 10.0, 1.0, key="p_soft")
+        group("Anion leak (e.g. Cl⁻)")
+        p_ga = st.number_input("Anion leak / ions s⁻¹ mV⁻¹", 0.0, 1000.0, 0.0, 0.5, key="p_ga",
+                               help="Anions follow Δψ across the membrane and neutralize the pumped "
+                                    "charge without carrying protons. 0 = no anion leak.")
+        with st.expander("Anion details"):
+            p_Ain = st.number_input("[anion] inside at the start / mM", 0.1, 2000.0, 100.0, 10.0, key="p_Ain")
+            p_Aout = st.number_input("[anion] outside / mM", 0.1, 2000.0, 100.0, 10.0, key="p_Aout",
+                                     help="The outside is a large reservoir and stays constant.")
         group("Time")
         p_T = st.number_input("Simulated time / s", 0.1, 10000.0, 20.0, 5.0, key="p_T")
 
     r = run_proton(outer_diameter_nm=p_d, capacitance_uF_cm2=p_C, pH_start=p_pH, buffer_mM=p_buf,
                    buffer_pKa=p_pKa, membrane_buffering=p_mem, lipid_area_nm2=p_area,
                    titratable_fraction=p_frac, headgroup_pKa=p_hpKa, pump_max=p_rate, pump_dG_kJ=p_dG,
-                   pump_width_mV=p_w, pump_into=p_into, leak_conductance=p_g, leak_threshold_mV=p_thr,
-                   leak_softness_mV=p_soft, duration_s=p_T)
+                   pump_width_mV=p_w, pump_into=p_into, pump_off_s=p_off, leak_conductance=p_g,
+                   leak_threshold_mV=p_thr, leak_softness_mV=p_soft, anion_conductance=p_ga,
+                   anion_in_mM=p_Ain, anion_out_mM=p_Aout, duration_s=p_T)
+    proton_kw = dict(outer_diameter_nm=p_d, capacitance_uF_cm2=p_C, pH_start=p_pH, buffer_mM=p_buf,
+                     buffer_pKa=p_pKa, membrane_buffering=p_mem, lipid_area_nm2=p_area,
+                     titratable_fraction=p_frac, headgroup_pKa=p_hpKa, pump_max=p_rate, pump_dG_kJ=p_dG,
+                     pump_width_mV=p_w, pump_into=p_into, pump_off_s=p_off, leak_conductance=p_g,
+                     leak_threshold_mV=p_thr, leak_softness_mV=p_soft, duration_s=p_T)
+    r_noA = run_proton(**proton_kw, anion_conductance=0.0) if p_ga > 0 else None
     t = r["time"]
     psi_end, dpH_end = r["psi_mV"][-1], r["delta_pH"][-1]
-    i90 = int(np.argmax(np.abs(r["psi_mV"]) >= 0.9 * abs(psi_end))) if abs(psi_end) > 1 else 0
-    charges_end = abs(psi_end) / r["mV_per_charge"]
+    i_peak = int(np.argmax(np.abs(r["psi_mV"])))
+    psi_peak = r["psi_mV"][i_peak]
+    i90 = int(np.argmax(np.abs(r["psi_mV"]) >= 0.9 * abs(psi_peak))) if abs(psi_peak) > 1 else 0
+    charges_end = abs(psi_peak) / r["mV_per_charge"]
+    pump_was_off = p_off is not None and p_off < p_T
     H_per_pH = r["beta_start"] * r["volume_L"] * m.NA       # H⁺ needed to change the pH by 1 unit
 
     with main:
         question("Why does a proton pump build up Δψ, but hardly any ΔpH?")
         left, right = st.columns([1.2, 1], gap="large")
         with right:
-            sentence(f"Δψ reaches <b>{fmt_mV(psi_end)}</b> (90 % of it within {fmt_time(t[i90])}).")
+            sentence(f"Δψ reaches <b>{fmt_mV(psi_peak)}</b> (90 % of it within {fmt_time(t[i90])}).")
             pH_mV = abs(r["Z_mV"] * dpH_end)
-            if pH_mV < 0.2 * abs(psi_end):
+            if r_noA is not None:
+                sentence(f"With the <span class='anion'>anion leak</span>, Δψ ends at <b>{fmt_mV(psi_end)}</b> "
+                         f"instead of {fmt_mV(r_noA['psi_mV'][-1])}, and ΔpH at <b>{fmt_signed(dpH_end, 3)}</b> "
+                         f"instead of {fmt_signed(r_noA['delta_pH'][-1], 3)}. "
+                         f"{fmt_count(abs(r['anions_in'][-1]))} anions crossed the membrane and neutralized "
+                         "the pumped charge, so the pump kept running and the protons stayed in the lumen.")
+            elif pH_mV < 0.2 * abs(psi_peak):
                 sentence(f"The <span class='ph'>pH inside</span> changes by only <b>{fmt_signed(dpH_end, 3)}</b> "
                          f"units, worth {pH_mV:.1f} mV of proton-motive force.")
                 sentence(f"The reason: moving about <b>{fmt_count(charges_end)}</b> <span class='h'>H⁺</span> "
-                         f"across the membrane gives {fmt_mV(psi_end)}, but it takes "
+                         f"across the membrane gives {fmt_mV(psi_peak)}, but it takes "
                          f"{fmt_count(H_per_pH)} H⁺ to change the pH inside by one unit. "
                          "The membrane capacitance is small, the buffer capacity is large.")
             else:
@@ -134,19 +162,39 @@ with tab_proton:
                 sentence(f"The reason: the lumen is hardly buffered. It takes only {fmt_count(H_per_pH)} "
                          f"<span class='h'>H⁺</span> to change its pH by one unit, so the pH changes "
                          "before the membrane is charged.")
+            if pump_was_off:
+                after = t >= p_off
+                psi_at_off = r["psi_mV"][after][0]
+                half = np.flatnonzero(np.abs(r["psi_mV"][after]) <= 0.5 * abs(psi_at_off))
+                decay = (f"halves within <b>{fmt_time(t[after][half[0]] - p_off)}</b>" if half.size and abs(psi_at_off) > 1
+                         else "does not halve within the simulated time")
+                sentence(f"After the pump is switched off at {fmt_time(p_off)}, Δψ {decay} and ends at "
+                         f"{fmt_mV(psi_end)}; ΔpH ends at {fmt_signed(dpH_end, 3)}.")
         with left:
             i_end = len(t) - 1
+
+            def visible(x):  # hide arrows for flows below 1 % of the maximum pump rate
+                return x if abs(x) >= 0.01 * p_rate else 0.0
             show(vesicle_pair(
                 dict(title="Start", lines=[(f"pH {p_pH:.2f}", PH_COLOR), ("Δψ 0 mV", INK)], psi_mV=0.0,
                      arrows=[(r["J_pump"][0], H_COLOR, "H⁺ pump")], fill=H_LIGHT, fill_level=0.3),
                 dict(title=f"After {fmt_time(t[-1])}",
                      lines=[(f"pH {r['pH_in'][i_end]:.2f}", PH_COLOR), (f"Δψ {fmt_mV(psi_end)}", INK)],
                      psi_mV=psi_end,
-                     arrows=[(r["J_pump"][i_end], H_COLOR, "H⁺ pump"), (r["J_leak"][i_end], MUTED, "H⁺ leak")],
+                     arrows=[(visible(r["J_pump"][i_end]), H_COLOR, "H⁺ pump"),
+                             (visible(r["J_leak"][i_end]), MUTED, "H⁺ leak"),
+                             (visible(r["J_anion"][i_end]), ANION_COLOR, "A⁻ leak")],
                      fill=H_LIGHT, fill_level=0.3),
                 f"outside: pH {p_pH:.2f}, constant"))
 
         sign = 1 if p_into else -1
+
+        def mark_pump_off(ax):
+            if pump_was_off:
+                ax.axvline(p_off, color=H_COLOR, linestyle=":", linewidth=1.2)
+                ax.text(p_off, 1.0, " pump off", transform=ax.get_xaxis_transform(), color=H_COLOR,
+                        fontsize=9, va="top")
+
         c1, c2 = st.columns(2)
         with c1:
             fig, ax = new_axes("Δψ / mV", t[-1])
@@ -156,15 +204,21 @@ with tab_proton:
             if p_g > 0:
                 ax.axhline(sign * p_thr, color=MUTED, linestyle=":", linewidth=1)
                 label_line(ax, sign * p_thr, "leak starts", MUTED, va="top" if p_into else "bottom")
-            ax.plot(t, r["psi_mV"], color=INK, linewidth=2.2)
-            show(finish(fig, ax))
-            st.caption("Membrane potential. It approaches its final value within a fraction of a second.")
+            if r_noA is not None:
+                ax.plot(t, r_noA["psi_mV"], color=MUTED, linewidth=1.6, linestyle="--", label="without anion leak")
+            ax.plot(t, r["psi_mV"], color=INK, linewidth=2.2, label="with anion leak" if r_noA is not None else None)
+            mark_pump_off(ax)
+            show(finish(fig, ax, legend=r_noA is not None))
+            st.caption("Membrane potential. It builds up within a fraction of a second.")
         with c2:
             fig, ax = new_axes("ΔpH = pH(inside) − pH(start)", t[-1])
             ax.axhline(0, color=MUTED, linewidth=0.8)
-            ax.plot(t, r["delta_pH"], color=PH_COLOR, linewidth=2.2)
-            show(finish(fig, ax))
-            st.caption("Change of the internal pH. Note the much smaller scale.")
+            if r_noA is not None:
+                ax.plot(t, r_noA["delta_pH"], color=PH_COLOR, linewidth=1.5, linestyle="--", label="without anion leak")
+            ax.plot(t, r["delta_pH"], color=PH_COLOR, linewidth=2.2, label="with anion leak" if r_noA is not None else None)
+            mark_pump_off(ax)
+            show(finish(fig, ax, legend=r_noA is not None))
+            st.caption("Change of the internal pH. Compare the scale with the Δψ plot: 1 pH unit is worth 59 mV.")
         c3, c4 = st.columns(2)
         with c3:
             fig, ax = new_axes("mV", t[-1])
@@ -173,26 +227,38 @@ with tab_proton:
                     label="total H⁺ gradient")
             ax.plot(t, r["psi_mV"], color=INK, linewidth=1.2, linestyle="--", label="from Δψ")
             ax.plot(t, -r["Z_mV"] * r["delta_pH"], color=PH_COLOR, linewidth=1.8, label="from ΔpH")
+            mark_pump_off(ax)
             show(finish(fig, ax, legend=True))
-            st.caption("Proton-motive force: Δψ − 59 mV·ΔpH at 25 °C. Almost all of it is Δψ.")
+            st.caption("Proton-motive force: Δψ − 59 mV·ΔpH at 25 °C, and how much of it comes from each part.")
         with c4:
-            fig, ax = new_axes("Flow into the vesicle / H⁺ s⁻¹", t[-1])
+            fig, ax = new_axes("Flow into the vesicle / ions s⁻¹", t[-1])
             ax.axhline(0, color=MUTED, linewidth=0.8)
-            ax.plot(t, r["J_pump"], color=H_COLOR, linewidth=2.2, label="pump")
-            ax.plot(t, r["J_leak"], color=MUTED, linewidth=1.8, label="leak")
-            ax.plot(t, r["J_pump"] + r["J_leak"], color=INK, linewidth=1.2, linestyle="--", label="net")
+            ax.plot(t, r["J_pump"], color=H_COLOR, linewidth=2.2, label="H⁺ pump")
+            ax.plot(t, r["J_leak"], color=MUTED, linewidth=1.8, label="H⁺ leak")
+            ax.plot(t, r["J_pump"] + r["J_leak"], color=INK, linewidth=1.2, linestyle="--", label="net H⁺")
+            if p_ga > 0:
+                ax.plot(t, r["J_anion"], color=ANION_COLOR, linewidth=1.8, label="anions (A⁻)")
+            ax.set_ylabel("Flow into the vesicle / ions s⁻¹", color=INK, fontsize=10.5)
+            mark_pump_off(ax)
             show(finish(fig, ax, legend=True))
-            st.caption("The pump slows down as the gradient grows; the leak sets in above its threshold.")
+            st.caption("Positive = into the vesicle. The pump slows down as the gradient grows; "
+                       "the proton leak sets in above its threshold.")
 
         df = pd.DataFrame({"time_s": t, "delta_psi_mV": r["psi_mV"], "pH_inside": r["pH_in"],
                            "delta_pH": r["delta_pH"], "pmf_mV": r["pmf_mV"],
-                           "pump_H_per_s": r["J_pump"], "leak_H_per_s": r["J_leak"]})
+                           "pump_H_per_s": r["J_pump"], "leak_H_per_s": r["J_leak"],
+                           "anion_flow_into_vesicle_per_s": r["J_anion"], "anion_inside_mM": r["anion_in_mM"]})
+        if r_noA is not None:
+            df["delta_psi_without_anion_leak_mV"] = r_noA["psi_mV"]
+            df["delta_pH_without_anion_leak"] = r_noA["delta_pH"]
         params = dict(outer_diameter_nm=p_d, capacitance_uF_per_cm2=p_C, pH_start=p_pH, buffer_mM=p_buf,
                       buffer_pKa=p_pKa, headgroup_buffering=p_mem, area_per_lipid_nm2=p_area,
                       titratable_fraction=p_frac, headgroup_pKa=p_hpKa,
                       pump_direction="into vesicle" if p_into else "out of vesicle", pump_max_H_per_s=p_rate,
                       pump_driving_energy_kJ_per_mol=p_dG, pump_slowdown_width_mV=p_w,
+                      pump_switched_off_s=p_off if p_off is not None else "never",
                       leak_H_per_s_per_mV=p_g, leak_threshold_mV=p_thr, leak_softness_mV=p_soft,
+                      anion_leak_ions_per_s_per_mV=p_ga, anion_inside_start_mM=p_Ain, anion_outside_mM=p_Aout,
                       inner_volume_L=f"{r['volume_L']:.6e}", capacitance_F=f"{r['C_F']:.6e}",
                       pump_stopping_potential_mV=f"{r['stop_mV']:.2f}")
         st.download_button("Download data as CSV", csv_with_header("Proton pump simulation", params, df),
@@ -213,9 +279,16 @@ with tab_proton:
             st.latex(r"J_\mathrm{pump} = J_\mathrm{max}\,\tanh\!\left("
                      r"\frac{\Delta G/F - (\Delta\psi - 2.3\,\tfrac{RT}{F}\,\Delta\mathrm{pH})}{2w}\right)")
             st.markdown(
-                "Simplifications: counter-ion movement is not modelled, the outside pH stays "
-                "constant, the leak is phenomenological, and the headgroups are treated as a "
-                "buffer dissolved in the lumen.")
+                "The optional **anion leak** (e.g. Cl⁻) moves anions along their electrochemical "
+                "gradient. Each anion that enters cancels the charge of one pumped proton, so it "
+                "lowers Δψ without changing the pH. The pump then keeps running, and more protons "
+                "accumulate in the lumen: a permeant anion converts Δψ into ΔpH.")
+            st.latex(r"J_\mathrm{A^-,in} = g_\mathrm{A}\,(\Delta\psi - E_\mathrm{A})"
+                     r"\qquad E_\mathrm{A} = \frac{RT}{F}\ln\frac{[\mathrm{A^-}]_{in}}{[\mathrm{A^-}]_{out}}")
+            st.markdown(
+                "Simplifications: the outside is a large reservoir with constant pH and [anion]; "
+                "other ions (e.g. K⁺, Na⁺) do not move; the proton leak is phenomenological; "
+                "the headgroups are treated as a buffer dissolved in the lumen.")
 
 
 # ==================================================================

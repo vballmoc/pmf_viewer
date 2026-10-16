@@ -14,6 +14,7 @@ K_LIGHT = "#E9DDF3"
 H_COLOR = "#C77D12"
 H_LIGHT = "#F6E7CF"
 PH_COLOR = "#2A7F7F"
+ANION_COLOR = "#3E6FA3"
 INK = "#22303C"
 MUTED = "#66727D"
 GRID = "#E3E7EB"
@@ -31,6 +32,7 @@ CSS = f"""
   .k {{ color: {K_COLOR}; font-weight: 600; }}
   .h {{ color: {H_COLOR}; font-weight: 600; }}
   .ph {{ color: {PH_COLOR}; font-weight: 600; }}
+  .anion {{ color: {ANION_COLOR}; font-weight: 600; }}
   .group {{ font-weight: 700; color: {INK}; margin: 0.9rem 0 0.1rem 0; }}
 </style>
 """
