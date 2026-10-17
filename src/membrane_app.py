@@ -321,20 +321,37 @@ with tab_valino:
         v_rate = st.number_input("Load at the start / charges per second", 0.0, 1_000_000.0, 1500.0, 100.0,
                                  key="v_rate")
         v_t0 = st.number_input("Load switched on after / s", 0.0, 100000.0, 0.0, 1.0, key="v_t0")
+        group("Anion leak (e.g. Cl⁻)")
+        v_ga = st.number_input("Anion leak / ions s⁻¹ mV⁻¹", 0.0, 1000.0, 0.0, 0.5, key="v_ga",
+                               help="Anions cross the membrane along Δψ. Valinomycin compensates each one "
+                                    "with a K⁺, so K⁺ and anions leak out together (like KCl), even "
+                                    "without a load. 0 = no anion leak.")
+        with st.expander("Anion details"):
+            v_Ain = st.number_input("[anion] inside at the start / mM", 0.1, 2000.0, 100.0, 10.0, key="v_Ain")
+            v_Aout = st.number_input("[anion] outside / mM", 0.1, 2000.0, 100.0, 10.0, key="v_Aout",
+                                     help="The outside is a large reservoir and stays constant.")
         group("Time and threshold")
         v_T = st.number_input("Simulated time / s", 0.1, 100000.0, 60.0, 10.0, key="v_T")
         v_thr = st.number_input("Useful Δψ at least / mV", 0.0, 500.0, 50.0, 5.0, key="v_thr",
                                 help="Below this value, Δψ counts as too weak to be useful.")
 
-    r = run_valino(outer_diameter_nm=v_d, bilayer_nm=v_bil, temperature_C=v_temp, K_in_mM=v_Kin,
-                   K_out_mM=v_Kout, load_direction=LOAD_DIRECTIONS[v_dir], load_model=LOAD_MODELS[v_model],
-                   load_rate=v_rate, load_start_s=v_t0, duration_s=v_T)
+    valino_kw = dict(outer_diameter_nm=v_d, bilayer_nm=v_bil, temperature_C=v_temp, K_in_mM=v_Kin,
+                     K_out_mM=v_Kout, load_direction=LOAD_DIRECTIONS[v_dir], load_model=LOAD_MODELS[v_model],
+                     load_rate=v_rate, load_start_s=v_t0, duration_s=v_T)
+    r = run_valino(**valino_kw, anion_conductance=v_ga, anion_in_mM=v_Ain, anion_out_mM=v_Aout)
+    r_noA = run_valino(**valino_kw) if v_ga > 0 else None
     t, psi = r["time"], r["psi_mV"]
-    finite = np.isfinite(psi)
-    useful = np.zeros_like(t, dtype=bool)
-    useful[finite] = np.abs(psi[finite]) >= v_thr
-    useful_after = useful & (t >= v_t0)
-    lifetime = t[np.flatnonzero(useful_after)[-1]] - v_t0 if useful_after.any() else None
+
+    def lifetime_of(res):
+        """Time after the load starts during which |Δψ| ≥ threshold; and whether it still is at the end."""
+        p = res["psi_mV"]
+        ok = np.zeros_like(t, dtype=bool)
+        fin = np.isfinite(p)
+        ok[fin] = np.abs(p[fin]) >= v_thr
+        after = ok & (t >= v_t0)
+        return (t[np.flatnonzero(after)[-1]] - v_t0 if after.any() else None), bool(ok[-1])
+
+    lifetime, useful_at_end = lifetime_of(r)
     i_load = int(np.argmax(t >= v_t0))
     k_max = max(r["K_in_mM"].max(), v_Kout)
 
@@ -348,29 +365,51 @@ with tab_valino:
             if lifetime is None:
                 sentence(f"Δψ is never at least <b>{v_thr:.0f} mV</b> while the load runs, so this "
                          "gradient is too weak to be useful from the beginning.")
-            elif useful[-1]:
+            elif useful_at_end:
                 sentence(f"Δψ is still at least {v_thr:.0f} mV at the end: it lasts <b>longer than "
                          f"{fmt_time(t[-1] - v_t0)}</b>. Increase the simulated time to see when it drops.")
             else:
-                sentence(f"Δψ stays at least {v_thr:.0f} mV for <b>{fmt_time(lifetime)}</b> after the "
-                         "load is switched on.")
+                sentence(f"Δψ stays at least {v_thr:.0f} mV for <b>{fmt_time(lifetime)}</b>"
+                         + (" after the load is switched on." if v_rate > 0 and v_t0 > 0 else "."))
+            if r_noA is not None:
+                n_A = r["anions_in"][np.isfinite(r["anions_in"])][-1]
+                way = "left" if n_A < 0 else "entered"
+                life0, end0 = lifetime_of(r_noA)
+
+                def life_text(life, at_end):
+                    if life is None:
+                        return "never"
+                    return f"longer than {fmt_time(t[-1] - v_t0)}" if at_end else fmt_time(life)
+                end_differs = abs(np.nan_to_num(psi[-1]) - np.nan_to_num(r_noA["psi_mV"][-1])) >= 1
+                end_text = (f"Δψ ends at <b>{fmt_mV(psi[-1])}</b> instead of {fmt_mV(r_noA['psi_mV'][-1])}, and stays "
+                            if end_differs else "Δψ stays ")
+                sentence(f"Through the <span class='anion'>anion leak</span>, {fmt_count(abs(n_A))} anions {way} "
+                         f"the vesicle, and as many <span class='k'>K⁺</span> {way} with them through valinomycin. "
+                         f"{end_text}useful for <b>{life_text(lifetime, useful_at_end)}</b> instead of "
+                         f"{life_text(life0, end0)}.")
             sentence(f"The vesicle contains <b>{fmt_count(r['K_ions_start'])}</b> "
                      f"<span class='k'>K⁺ ions</span>; "
                      f"{fmt_count(abs(r['K_ions_start'] - r['K_ions_equilibrium']))} of them must move "
                      "until the inside matches the outside.")
         with left:
             psi_end = psi[-1]
+            flow_scale = max(v_rate, np.nanmax(np.abs(r["J_K"])), 1.0)
+
+            def shown(x):  # hide arrows for flows below 1 % of the largest flow
+                return x if np.isfinite(x) and abs(x) >= 0.01 * flow_scale else 0.0
             show(vesicle_pair(
                 dict(title="Start", lines=[(f"[K⁺] {v_Kin:.3g} mM", K_COLOR), (f"Δψ {fmt_mV(r['psi_start'])}", INK)],
                      psi_mV=r["psi_start"],
-                     arrows=[(r["J_K"][i_load], K_COLOR, "K⁺"), (r["J_charge"][i_load], H_COLOR, "+ charge")],
+                     arrows=[(shown(r["J_K"][i_load]), K_COLOR, "K⁺"), (shown(r["J_charge"][i_load]), H_COLOR, "+ charge"),
+                             (shown(r["J_anion"][i_load]), ANION_COLOR, "A⁻")],
                      fill=K_LIGHT, fill_level=v_Kin / k_max),
                 dict(title=f"After {fmt_time(t[-1])}",
                      lines=[(f"[K⁺] {r['K_in_mM'][-1]:.3g} mM" if np.isfinite(psi_end) else "[K⁺] ≈ 0 mM", K_COLOR),
                             (f"Δψ {fmt_mV(psi_end)}" if np.isfinite(psi_end) else "K⁺ used up",
                              INK if np.isfinite(psi_end) else ALERT)],
                      psi_mV=psi_end,
-                     arrows=[(r["J_K"][-2], K_COLOR, "K⁺"), (r["J_charge"][-2], H_COLOR, "+ charge")],
+                     arrows=[(shown(r["J_K"][-2]), K_COLOR, "K⁺"), (shown(r["J_charge"][-2]), H_COLOR, "+ charge"),
+                             (shown(r["J_anion"][-2]), ANION_COLOR, "A⁻")],
                      fill=K_LIGHT, fill_level=r["K_in_mM"][-1] / k_max),
                 f"outside: [K⁺] {v_Kout:.3g} mM, constant", footer_color=K_COLOR))
         if r["t_used_up"] is not None:
@@ -390,16 +429,20 @@ with tab_valino:
             ax.axhspan(-v_thr, v_thr, color=GRID, alpha=0.6, linewidth=0)
             label_line(ax, v_thr, f"too weak (< {v_thr:.0f} mV)", MUTED)
             ax.axhline(0, color=MUTED, linewidth=0.8)
-            ax.plot(t, psi, color=INK, linewidth=2.2)
+            if r_noA is not None:
+                ax.plot(t, r_noA["psi_mV"], color=MUTED, linewidth=1.6, linestyle="--", label="without anion leak")
+            ax.plot(t, psi, color=INK, linewidth=2.2, label="with anion leak" if r_noA is not None else None)
             if r["t_used_up"] is not None:
                 ax.axvline(r["t_used_up"], color=ALERT, linestyle=":", linewidth=1.2)
                 ax.text(r["t_used_up"], 0.5, " K⁺ used up", transform=ax.get_xaxis_transform(),
                         color=ALERT, fontsize=9, va="center")
             mark_load(ax)
-            show(finish(fig, ax))
+            show(finish(fig, ax, legend=r_noA is not None))
             st.caption("Δψ = ψ(inside) − ψ(outside), always equal to the K⁺ Nernst potential.")
         with c2:
             fig, ax = new_axes("[K⁺] / mM", t[-1])
+            if r_noA is not None:
+                ax.plot(t, r_noA["K_in_mM"], color=K_COLOR, linewidth=1.4, linestyle=":", label="inside, without anion leak")
             ax.plot(t, r["K_in_mM"], color=K_COLOR, linewidth=2.2, label="inside")
             ax.axhline(v_Kout, color=K_COLOR, linestyle="--", linewidth=1.2, label="outside (constant)")
             ax.set_ylim(bottom=0)
@@ -410,18 +453,27 @@ with tab_valino:
         with c3:
             fig, ax = new_axes("Flow into the vesicle / ions s⁻¹", t[-1])
             ax.axhline(0, color=MUTED, linewidth=0.8)
-            ax.plot(t, r["J_charge"], color=H_COLOR, linewidth=2.2, label="positive charge moved by the load")
+            if v_rate > 0:
+                ax.plot(t, r["J_charge"], color=H_COLOR, linewidth=2.2, label="positive charge moved by the load")
             ax.plot(t, r["J_K"], color=K_COLOR, linewidth=2.2, label="K⁺ moved by valinomycin")
+            if v_ga > 0:
+                ax.plot(t, r["J_anion"], color=ANION_COLOR, linewidth=1.8, linestyle="--", label="anions (A⁻)")
             mark_load(ax)
             show(finish(fig, ax, legend=True))
-            st.caption("Every charge the load moves is compensated by one K⁺ moving the other way.")
+            st.caption("Positive = into the vesicle. Every charge that crosses the membrane (load or "
+                       "anions) is compensated by one K⁺ through valinomycin.")
 
         df = pd.DataFrame({"time_s": t, "delta_psi_mV": psi, "K_inside_mM": r["K_in_mM"],
                            "K_inside_ions": r["K_ions"], "charge_flow_into_vesicle_per_s": r["J_charge"],
-                           "K_flow_into_vesicle_per_s": r["J_K"]})
+                           "K_flow_into_vesicle_per_s": r["J_K"], "anion_flow_into_vesicle_per_s": r["J_anion"],
+                           "anion_inside_mM": r["anion_in_mM"]})
+        if r_noA is not None:
+            df["delta_psi_without_anion_leak_mV"] = r_noA["psi_mV"]
+            df["K_inside_without_anion_leak_mM"] = r_noA["K_in_mM"]
         params = dict(outer_diameter_nm=v_d, bilayer_thickness_nm=v_bil, temperature_C=v_temp,
                       K_inside_start_mM=v_Kin, K_outside_mM=v_Kout, load=f"{v_dir}; {v_model}",
                       load_at_start_charges_per_s=v_rate, load_switched_on_s=v_t0, useful_threshold_mV=v_thr,
+                      anion_leak_ions_per_s_per_mV=v_ga, anion_inside_start_mM=v_Ain, anion_outside_mM=v_Aout,
                       inner_volume_L=f"{r['volume_L']:.6e}",
                       note="delta_psi_mV is empty where the internal K+ is used up")
         st.download_button("Download data as CSV",
@@ -432,12 +484,17 @@ with tab_valino:
         with st.expander("How the model works"):
             st.markdown("Valinomycin is assumed to be much faster than the load, so at every moment:")
             st.latex(r"\Delta\psi = \frac{RT}{F}\,\ln\frac{[\mathrm{K^+}]_{out}}{[\mathrm{K^+}]_{in}}")
-            st.markdown("Each charge the load moves is compensated by one K⁺ in the opposite direction:")
-            st.latex(r"J_{\mathrm{K^+}} = -\,J_{\mathrm{charge}}\qquad "
-                     r"\frac{dN_{\mathrm{K^+,in}}}{dt} = J_{\mathrm{K^+}}")
+            st.markdown("Each charge that crosses the membrane, through the load or the anion leak, is "
+                        "compensated by one K⁺ through valinomycin (all flows counted into the vesicle):")
+            st.latex(r"J_{\mathrm{K^+}} = -\,J_{\mathrm{load}} + J_{\mathrm{A^-}}\qquad "
+                     r"J_{\mathrm{A^-}} = g_\mathrm{A}\,(\Delta\psi - E_\mathrm{A})")
+            st.markdown(
+                "With an anion leak and no load, K⁺ and anions leave together until E_K = E_A, i.e. "
+                "[K⁺]in·[A⁻]in = [K⁺]out·[A⁻]out. This is one way a K⁺ diffusion potential decays "
+                "in real liposomes even without any transport protein.")
             st.markdown(
                 "'Discharge' stops when [K⁺]inside = [K⁺]outside. The outside is a large reservoir "
-                "with constant [K⁺]. Osmotic effects, counter-ions and volume changes are not included.")
+                "with constant [K⁺] and [anion]. Osmotic effects and volume changes are not included.")
 
 
 # ==================================================================
@@ -461,12 +518,27 @@ with tab_combined:
         c_dG = st.number_input("Driving energy / kJ per mol H⁺", 2.0, 50.0, 15.0, 0.5, key="c_dG",
                                help="The pump stops when Δψ plus the ΔpH part reach this energy per charge.")
         c_w = st.number_input("Slowdown width / mV", 1.0, 50.0, 10.0, 1.0, key="c_w")
+        group("Leaks")
+        c_gH = st.number_input("Proton leak above threshold / H⁺ s⁻¹ mV⁻¹", 0.0, 1000.0, 0.0, 0.5, key="c_gH",
+                               help="The same proton leak as in the 'Proton pump' tab. 0 = no proton leak.")
+        with st.expander("Proton leak details"):
+            c_thrH = st.number_input("Leak starts at |Δψ| / mV", 0.0, 300.0, 40.0, 5.0, key="c_thrH")
+            c_softH = st.number_input("Softness of the onset / mV", 1.0, 50.0, 10.0, 1.0, key="c_softH")
+        c_ga = st.number_input("Anion leak (e.g. Cl⁻) / ions s⁻¹ mV⁻¹", 0.0, 1000.0, 0.0, 0.5, key="c_ga",
+                               help="Anions entering compensate the pumped charge, like K⁺ leaving does. "
+                                    "0 = no anion leak.")
+        with st.expander("Anion details"):
+            c_Ain = st.number_input("[anion] inside at the start / mM", 0.1, 2000.0, 100.0, 10.0, key="c_Ain")
+            c_Aout = st.number_input("[anion] outside / mM", 0.1, 2000.0, 100.0, 10.0, key="c_Aout")
         group("Comparison and time")
         c_thr = st.number_input("Δψ counts as low below / mV", 1.0, 200.0, 20.0, 5.0, key="c_thr")
         c_T = st.number_input("Simulated time / s", 0.1, 10000.0, 10.0, 5.0, key="c_T")
 
     kw = dict(outer_diameter_nm=c_d, pH_start=c_pH, buffer_mM=c_buf, buffer_pKa=c_pKa, K_in_mM=c_Kin,
-              K_out_mM=c_Kout, pump_max=c_rate, pump_dG_kJ=c_dG, pump_width_mV=c_w, duration_s=c_T)
+              K_out_mM=c_Kout, pump_max=c_rate, pump_dG_kJ=c_dG, pump_width_mV=c_w,
+              leak_conductance=c_gH, leak_threshold_mV=c_thrH, leak_softness_mV=c_softH,
+              anion_conductance=c_ga, anion_in_mM=c_Ain, anion_out_mM=c_Aout, duration_s=c_T)
+    leaks_on = c_gH > 0 or c_ga > 0
     r = run_combined(**kw, valinomycin=True)
     r0 = run_combined(**kw, valinomycin=False)
     t = r["time"]
@@ -477,8 +549,15 @@ with tab_combined:
 
     t_high = first_time(r["psi_mV"] >= c_thr)
     t_high0 = first_time(r0["psi_mV"] >= c_thr)
-    running = np.flatnonzero(r["pump_fraction"] >= 0.01)
+    pf = r["pump_fraction"]
+    running = np.flatnonzero(pf >= 0.01)
     t_stop = t[running[-1] + 1] if running.size and running[-1] + 1 < len(t) else None
+    # with leaks, the pump can settle at a steady rate that just balances the leaks
+    i90 = int(0.9 * (len(t) - 1))
+    pump_steady = (t_stop is None
+                   and abs(r["psi_mV"][-1] - r["psi_mV"][i90]) < 1.0
+                   and abs(r["pH_in"][-1] - r["pH_in"][i90]) < 0.01
+                   and abs(r["K_ions"][-1] - r["K_ions"][i90]) < 0.01 * max(r["K_ions_start"], 1.0))
     K_left = r["K_ions"][-1] / r["K_ions_start"] if r["K_ions_start"] > 0 else 0.0
     exported = r["K_ions_start"] - r["K_ions"][-1]
     i_end = len(t) - 1
@@ -493,7 +572,8 @@ with tab_combined:
             if t_high is None:
                 sentence(f"With valinomycin, Δψ stays below {c_thr:.0f} mV for the <b>whole run</b> "
                          f"(it ends at {fmt_mV(r['psi_mV'][-1])}), because "
-                         f"<span class='k'>K⁺</span> leaves for every <span class='h'>H⁺</span> pumped in.")
+                         f"<span class='k'>K⁺</span> leaves" + (" or an anion enters" if c_ga > 0 else "") +
+                         f" for every <span class='h'>H⁺</span> pumped in.")
             else:
                 sentence(f"With valinomycin, Δψ stays below {c_thr:.0f} mV for <b>{fmt_time(t_high)}</b>.")
             if t_stop is not None:
@@ -509,8 +589,19 @@ with tab_combined:
                 else:
                     why = parts
                 sentence(f"The pump stops after <b>{fmt_time(t_stop)}</b>. {why}")
+            elif pump_steady and leaks_on:
+                sentence(f"The pump keeps running at <b>{100 * pf[-1]:.0f} %</b> of its maximum rate: "
+                         "the leaks let as much charge escape as it pumps in.")
             else:
                 sentence("The pump is still running at the end. Increase the simulated time.")
+            if c_ga > 0:
+                H_in = r["H_net_in"][-1]
+                if H_in > 1:
+                    share_K = 100 * exported / H_in
+                    share_A = 100 * r["anions_in"][-1] / H_in
+                    sentence(f"Of the charge of the {fmt_count(H_in)} <span class='h'>H⁺</span> that came in, "
+                             f"<span class='k'>K⁺</span> leaving compensated <b>{share_K:.0f} %</b> and "
+                             f"<span class='anion'>anions</span> entering <b>{share_A:.0f} %</b>.")
             sentence(f"<b>{100 * (1 - K_left):.0f} %</b> of the <span class='k'>K⁺</span> inside was exported "
                      f"({fmt_count(exported)} of {fmt_count(r['K_ions_start'])} ions).")
         with left:
@@ -521,14 +612,17 @@ with tab_combined:
                      lines=[(f"[K⁺] {c_Kin:.3g} mM", K_COLOR), (f"pH {c_pH:.2f}", PH_COLOR),
                             (f"Δψ {fmt_mV(r['psi_mV'][0])}", INK)],
                      psi_mV=r["psi_mV"][0],
-                     arrows=[(flux_or_zero(r["J_K"][1]), K_COLOR, "K⁺"), (flux_or_zero(r["J_H"][1]), H_COLOR, "H⁺")],
+                     arrows=[(flux_or_zero(r["J_K"][1]), K_COLOR, "K⁺"),
+                             (flux_or_zero(r["J_H"][1] + r["J_leak"][1]), H_COLOR, "H⁺"),
+                             (flux_or_zero(r["J_anion"][1]), ANION_COLOR, "A⁻")],
                      fill=K_LIGHT, fill_level=0.8),
                 dict(title=f"After {fmt_time(t[-1])}",
                      lines=[(f"[K⁺] {r['K_in_mM'][i_end]:.3g} mM", K_COLOR), (f"pH {r['pH_in'][i_end]:.2f}", PH_COLOR),
                             (f"Δψ {fmt_mV(r['psi_mV'][i_end])}", INK)],
                      psi_mV=r["psi_mV"][i_end],
                      arrows=[(flux_or_zero(r["J_K"][i_end]), K_COLOR, "K⁺"),
-                             (flux_or_zero(r["J_H"][i_end]), H_COLOR, "H⁺")],
+                             (flux_or_zero(r["J_H"][i_end] + r["J_leak"][i_end]), H_COLOR, "H⁺"),
+                             (flux_or_zero(r["J_anion"][i_end]), ANION_COLOR, "A⁻")],
                      fill=K_LIGHT, fill_level=0.8 * K_left),
                 f"outside: [K⁺] {c_Kout:.3g} mM and pH {c_pH:.2f}, constant; valinomycin present"))
 
@@ -552,11 +646,19 @@ with tab_combined:
                        "buffer is exhausted.")
         c3, c4 = st.columns(2)
         with c3:
-            fig, ax = new_axes("K⁺ left inside / %", t[-1])
-            ax.plot(t, 100 * r["K_ions"] / r["K_ions_start"], color=K_COLOR, linewidth=2.2)
-            ax.set_ylim(0, 105)
-            show(finish(fig, ax))
-            st.caption("Each K⁺ that leaves compensates the charge of one pumped H⁺.")
+            fig, ax = new_axes("Ions moved across the membrane", t[-1])
+            ax.axhline(r["K_ions_start"], color=K_COLOR, linestyle=":", linewidth=1.2)
+            label_line(ax, r["K_ions_start"], "all K⁺ inside at the start", K_COLOR, va="top")
+            ax.plot(t, r["H_net_in"], color=H_COLOR, linewidth=2.2, label="H⁺ in")
+            ax.plot(t, r["K_ions_start"] - r["K_ions"], color=K_COLOR, linewidth=2.2, linestyle="--", label="K⁺ out")
+            if c_ga > 0:
+                ax.plot(t, r["anions_in"], color=ANION_COLOR, linewidth=1.8, label="anions in")
+            ax.set_ylim(bottom=min(0.0, np.nanmin(r["anions_in"]) * 1.1),
+                        top=max(r["K_ions_start"], np.nanmax(r["H_net_in"])) * 1.08)
+            show(finish(fig, ax, legend=True))
+            st.caption("With valinomycin. K⁺ leaving" + (" and anions entering" if c_ga > 0 else "") +
+                       " add up to the H⁺ that came in: every proton's charge is compensated. "
+                       "When the K⁺ curve reaches the dotted line, the K⁺ is used up.")
         with c4:
             fig, ax = new_axes("mV", t[-1])
             ax.axhline(r["stop_mV"], color=H_COLOR, linestyle="--", linewidth=1)
@@ -573,7 +675,9 @@ with tab_combined:
 
         df = pd.DataFrame({"time_s": t, "delta_psi_mV": r["psi_mV"], "pH_inside": r["pH_in"],
                            "K_inside_mM": r["K_in_mM"], "K_inside_ions": r["K_ions"],
-                           "H_pumped_total": r["H_pumped"], "pump_H_per_s": r["J_H"],
+                           "H_pumped_total": r["H_pumped"], "H_net_in_total": r["H_net_in"],
+                           "anions_in_total": r["anions_in"], "pump_H_per_s": r["J_H"],
+                           "proton_leak_H_per_s": r["J_leak"], "anion_flow_into_vesicle_per_s": r["J_anion"],
                            "K_flow_into_vesicle_per_s": r["J_K"], "back_pressure_mV": r["back_pressure_mV"],
                            "delta_psi_without_valinomycin_mV": r0["psi_mV"],
                            "pH_inside_without_valinomycin": r0["pH_in"]})
@@ -581,6 +685,9 @@ with tab_combined:
                       temperature_C=25.0, pH_start=c_pH, buffer_mM=c_buf, buffer_pKa=c_pKa,
                       K_inside_start_mM=c_Kin, K_outside_mM=c_Kout, pump_max_H_per_s=c_rate,
                       pump_driving_energy_kJ_per_mol=c_dG, pump_slowdown_width_mV=c_w,
+                      proton_leak_H_per_s_per_mV=c_gH, proton_leak_threshold_mV=c_thrH,
+                      proton_leak_softness_mV=c_softH, anion_leak_ions_per_s_per_mV=c_ga,
+                      anion_inside_start_mM=c_Ain, anion_outside_mM=c_Aout,
                       pump_stopping_potential_mV=f"{r['stop_mV']:.2f}", inner_volume_L=f"{r['volume_L']:.6e}")
         st.download_button("Download data as CSV",
                            csv_with_header("Proton pump with valinomycin simulation", params, df),
@@ -589,10 +696,11 @@ with tab_combined:
 
         with st.expander("How the model works"):
             st.markdown(
-                "Δψ comes from the net charge on the membrane: protons pumped in minus K⁺ that left. "
+                "Δψ comes from the net charge on the membrane: protons that came in, minus K⁺ that left, "
+                "minus anions that entered. "
                 "Valinomycin moves K⁺ along its electrochemical gradient, fast enough (~0.1 ms) "
                 "that Δψ stays at the K⁺ Nernst potential while K⁺ is available:")
-            st.latex(r"\Delta\psi = \frac{e\,(N_\mathrm{H^+,pumped} - N_\mathrm{K^+,exported})}{C}"
+            st.latex(r"\Delta\psi = \frac{e\,(N_\mathrm{H^+,in} - N_\mathrm{K^+,out} - N_\mathrm{A^-,in})}{C}"
                      r"\qquad J_\mathrm{K^+} \propto -(\Delta\psi - E_\mathrm{K})")
             st.markdown(
                 "The pump is the same as in the 'Proton pump' tab and feels both Δψ and ΔpH. "
@@ -600,5 +708,9 @@ with tab_combined:
                 "(buffer and water). When the internal K⁺ runs out, E_K rises steeply, K⁺ export "
                 "stops by itself, and the protons charge the membrane as without valinomycin.")
             st.markdown(
-                "Simplifications: no proton leak, no lipid headgroup buffering, bilayer 4.5 nm, "
-                "capacitance 1 µF cm⁻², 25 °C. The outside is a large reservoir with constant pH and [K⁺].")
+                "The optional leaks are the same as in the 'Proton pump' tab: the proton leak changes "
+                "Δψ and pH, the anion leak only Δψ. The comparison run without valinomycin has the "
+                "same leaks.")
+            st.markdown(
+                "Simplifications: no lipid headgroup buffering, bilayer 4.5 nm, capacitance 1 µF cm⁻², "
+                "25 °C. The outside is a large reservoir with constant pH, [K⁺] and [anion].")

@@ -58,9 +58,15 @@ def pump_rate(back_pressure_mV, rate_max, stop_mV, width_mV):
 
 
 def soft_leak(psi_mV, conductance, threshold_mV, softness_mV):
-    """Proton leak (into the vesicle) that rises smoothly above |Δψ| = threshold."""
+    """Proton leak (into the vesicle) that rises smoothly above |Δψ| = threshold.
+
+    The value at Δψ = 0 is subtracted, so the leak is exactly zero without a potential
+    and changes smoothly through 0 mV. (Without this, it jumped between −0.9 and +0.9
+    H⁺/s at 0 mV, which made the solver stick to Δψ = 0.)
+    """
     x = (np.abs(psi_mV) - threshold_mV) / softness_mV
-    return -np.sign(psi_mV) * conductance * softness_mV * np.logaddexp(0, x)
+    x0 = -threshold_mV / softness_mV
+    return -np.sign(psi_mV) * conductance * softness_mV * (np.logaddexp(0, x) - np.logaddexp(0, x0))
 
 
 # ------------------------------------------------------------
@@ -150,68 +156,126 @@ def proton_model(outer_diameter_nm=200.0, bilayer_nm=4.5, capacitance_uF_cm2=1.0
 
 
 # ------------------------------------------------------------
-# 2) Valinomycin: a K⁺ gradient as a battery (same algorithm as valino1_app.py)
+# 2) Valinomycin: a K⁺ gradient as a battery, optionally with an anion leak
 # ------------------------------------------------------------
 def valino_model(outer_diameter_nm=100.0, bilayer_nm=4.5, temperature_C=25.0,
                  K_in_mM=50.0, K_out_mM=5.0, load_direction="dissipate", load_model="potential",
-                 load_rate=1500.0, load_start_s=0.0, duration_s=60.0):
-    """load_direction: 'dissipate', 'in' or 'out'; load_model: 'potential' or 'constant'."""
+                 load_rate=1500.0, load_start_s=0.0,
+                 anion_conductance=0.0, anion_in_mM=100.0, anion_out_mM=100.0,
+                 duration_s=60.0):
+    """Valinomycin is fast, so Δψ always equals the K⁺ Nernst potential.
+
+    load_direction: 'dissipate', 'in' or 'out'; load_model: 'potential' or 'constant'.
+    Every charge that crosses the membrane (the load, or anions through the anion leak)
+    is compensated by one K⁺ moving through valinomycin:
+        dN_K/dt = −J_load + J_anion      (all fluxes counted INTO the vesicle)
+        J_anion = g_A · (Δψ − E_anion)
+    'Discharge' stops when Δψ reaches 0. If the internal K⁺ is used up, the clamp
+    no longer holds and Δψ is not defined from then on (NaN).
+    """
     geo = geometry(outer_diameter_nm, bilayer_nm)
     V = geo["volume_L"]
     RT_F = nernst_factor_mV(temperature_C)
 
-    def nernst(K_mM):
-        return RT_F * np.log(max(K_out_mM, 1e-30) / max(K_mM, 1e-30))
+    def count(mM):
+        return mM * 1e-3 * V * NA
 
-    N = K_in_mM * 1e-3 * V * NA
-    N_start = N
-    N_eq = K_out_mM * 1e-3 * V * NA
-    psi_start = nernst(K_in_mM)
+    def conc_mM(n):
+        return np.maximum(n, 1e-30) / NA / V * 1000
+
+    N0, A0, N_eq = count(K_in_mM), count(anion_in_mM), count(K_out_mM)
+
+    def psi_of(N):
+        return RT_F * np.log(K_out_mM / conc_mM(N))
+
+    psi0 = float(psi_of(N0))
+    s0 = np.sign(psi0)
+
+    def load_in(psi, active):
+        """Positive charge moved INTO the vesicle by the load."""
+        if not active:
+            return 0.0 * psi
+        if load_model == "constant":
+            J = load_rate + 0.0 * psi
+        else:
+            J = load_rate * np.abs(psi) / abs(psi0) if abs(psi0) > 1e-12 else 0.0 * psi
+        if load_direction == "dissipate":
+            return -s0 * J
+        return J if load_direction == "in" else -J
+
+    def anion_in(psi, N_A):
+        if anion_conductance <= 0:
+            return 0.0 * psi
+        return anion_conductance * (psi - RT_F * np.log(conc_mM(N_A) / anion_out_mM))
+
+    def make_rhs(active):
+        def rhs(t, y):
+            N, N_A = y
+            psi = psi_of(N)
+            J_a = anion_in(psi, N_A)
+            return [-load_in(psi, active) + J_a, J_a]
+        return rhs
+
+    def ev_used_up(t, y):
+        return y[0] - 1e-9 * N0
+    ev_used_up.terminal, ev_used_up.direction = True, -1
+
+    def ev_gradient_spent(t, y):
+        return y[0] - N_eq
+    ev_gradient_spent.terminal = True
 
     n = max(1000, min(30000, int(duration_s * 20)))
     t = np.linspace(0, duration_s, n)
-    dt = t[1] - t[0]
-    K_mM, psi, N_K = np.zeros(n), np.zeros(n), np.zeros(n)
-    J_charge, J_K = np.zeros(n), np.zeros(n)
+    N_out, A_out = np.full(n, np.nan), np.full(n, np.nan)
+    t_now, y = 0.0, np.array([N0, A0])
+    spent = load_direction == "dissipate" and abs(psi0) < 1e-12
+    t_spent = 0.0 if spent else np.inf
+    t_used_up = None
+    filled = 0
+    atol = [max(N0, 1.0) * 1e-12, max(A0, 1.0) * 1e-12]
 
-    for i in range(n):
-        K_mM[i] = N / NA / V * 1000
-        psi[i] = nernst(K_mM[i])
-        N_K[i] = N
-        if i == n - 1:
-            break
-        if t[i] < load_start_s:
-            J = 0.0
-        elif load_model == "constant":
-            J = load_rate
-        else:
-            J = load_rate * abs(psi[i]) / abs(psi_start) if abs(psi_start) > 1e-12 else 0.0
-        if load_direction == "dissipate":
-            Jc = -np.sign(psi[i]) * J
-        elif load_direction == "in":
-            Jc = J
-        else:
-            Jc = -J
-        Jk = -Jc
-        if Jk < 0:
-            Jk = max(Jk, -N / dt)
-        if load_direction == "dissipate":
-            if psi_start < 0:
-                Jk = max(Jk, -max((N - N_eq) / dt, 0.0))
-            elif psi_start > 0:
-                Jk = min(Jk, max((N_eq - N) / dt, 0.0))
-            else:
-                Jk = 0.0
-        N = max(N + Jk * dt, 1e-30)
-        J_charge[i], J_K[i] = Jc, Jk
-    J_charge[-1], J_K[-1] = J_charge[-2], J_K[-2]
+    # Integrate piece by piece: before the load starts, while it runs, and after a
+    # 'discharge' load has spent the gradient. Each switch is a sudden change.
+    while t_now < duration_s:
+        load_on = t_now >= load_start_s
+        t_end = duration_s if load_on else min(load_start_s, duration_s)
+        active = load_on and not spent and load_rate > 0
+        events = [ev_used_up] + ([ev_gradient_spent] if active and load_direction == "dissipate" else [])
+        sol = solve_ivp(make_rhs(active), (t_now, t_end), y, method="Radau", events=events,
+                        dense_output=True, rtol=1e-9, atol=atol)
+        if not sol.success:
+            raise RuntimeError(sol.message)
+        t_stop = sol.t[-1]
+        idx = np.arange(filled, n)[t[filled:] <= t_stop + 1e-12 * max(duration_s, 1)]
+        if idx.size:
+            N_out[idx], A_out[idx] = sol.sol(np.minimum(t[idx], t_stop))
+            filled = idx[-1] + 1
+        y, t_now = sol.y[:, -1], t_stop
+        if sol.status == 1:
+            if sol.t_events[0].size:          # internal K⁺ used up
+                t_used_up = t_stop
+                break
+            spent, t_spent = True, t_stop     # discharge finished: load switches off
 
-    used_up = N_K <= 1e-9 * N_start
-    t_used_up = t[np.argmax(used_up)] if used_up.any() else None
-    psi[used_up] = np.nan
-    return dict(time=t, psi_mV=psi, K_in_mM=K_mM, K_ions=N_K, J_charge=J_charge, J_K=J_K,
-                K_ions_start=N_start, K_ions_equilibrium=N_eq, psi_start=psi_start,
-                t_used_up=t_used_up, **geo)
+    used_up = np.zeros(n, dtype=bool)
+    if t_used_up is not None:
+        used_up[filled:] = True
+        N_out[filled:] = 0.0
+        A_out[filled:] = y[1]
+
+    psi = psi_of(N_out)
+    active_grid = (t >= load_start_s) & (t < t_spent) & (load_rate > 0)
+    J_charge = np.where(active_grid, load_in(psi, True), 0.0)
+    J_A = anion_in(psi, A_out)
+    J_K = -J_charge + J_A
+    if t_used_up is not None:               # clamp no longer valid: Δψ undefined
+        J_charge = np.where(used_up, load_in(np.full(n, psi0), True) * (t >= load_start_s), J_charge)
+        J_K[used_up], J_A[used_up] = 0.0, 0.0
+        psi[used_up] = np.nan
+    return dict(time=t, psi_mV=psi, K_in_mM=conc_mM(N_out) * (N_out > 0), K_ions=N_out,
+                J_charge=J_charge, J_K=J_K, J_anion=J_A, anion_in_mM=conc_mM(A_out),
+                anions_in=A_out - A0, K_ions_start=N0, K_ions_equilibrium=N_eq,
+                psi_start=psi0, t_used_up=t_used_up, **geo)
 
 
 # ------------------------------------------------------------
@@ -224,12 +288,18 @@ def combined_model(outer_diameter_nm=100.0, bilayer_nm=4.5, capacitance_uF_cm2=1
                    temperature_C=25.0, pH_start=7.0, buffer_mM=50.0, buffer_pKa=7.5,
                    K_in_mM=50.0, K_out_mM=50.0,
                    pump_max=1000.0, pump_dG_kJ=15.0, pump_width_mV=10.0,
-                   valinomycin=True, duration_s=60.0, n_points=1500):
+                   valinomycin=True,
+                   leak_conductance=0.0, leak_threshold_mV=40.0, leak_softness_mV=10.0,
+                   anion_conductance=0.0, anion_in_mM=100.0, anion_out_mM=100.0,
+                   duration_s=60.0, n_points=1500):
     """A pump moves H⁺ into the vesicle; valinomycin lets K⁺ move to compensate the charge.
 
-    States: H⁺ pumped in (count), K⁺ inside (count), ΔpH.
+    Optional leaks, the same as in the proton model: a proton leak (changes Δψ and pH)
+    and an anion leak (changes only Δψ).
+
+    States: net H⁺ moved in, K⁺ inside, ΔpH, anions inside, H⁺ moved by the pump (counts).
     Δψ comes from the net charge on the membrane capacitance:
-        Δψ = (H⁺ pumped in − K⁺ that left) · mV per charge
+        Δψ = (H⁺ moved in − K⁺ that left − anions that entered) · mV per charge
     Valinomycin moves K⁺ along its electrochemical gradient, J_K ∝ −(Δψ − E_K),
     fast enough that Δψ stays at E_K while K⁺ is available. When the internal K⁺
     runs out, E_K rises steeply and K⁺ export stops by itself, so from then on the
@@ -241,32 +311,42 @@ def combined_model(outer_diameter_nm=100.0, bilayer_nm=4.5, capacitance_uF_cm2=1
     Z = np.log(10) * RT_F
     stop_mV = pump_dG_kJ * 1000 / F * 1000
     N_start = K_in_mM * 1e-3 * V * NA
+    A_start = anion_in_mM * 1e-3 * V * NA
     g_val = VALINOMYCIN_SPEED / mVpc if valinomycin else 0.0   # K⁺ s⁻¹ mV⁻¹
 
-    def state(Q, N, dpH):
-        psi = (Q - (N_start - N)) * mVpc
+    def state(Q, N, dpH, N_A):
+        psi = (Q - (N_start - N) - (N_A - A_start)) * mVpc
         K_mM = max(N, 0.0) / NA / V * 1000
         E_K = RT_F * np.log(K_out_mM / max(K_mM, 1e-12))
         back = psi - Z * dpH
-        J_H = pump_rate(back, pump_max, stop_mV, pump_width_mV)
+        J_pump = pump_rate(back, pump_max, stop_mV, pump_width_mV)
+        J_leak = soft_leak(psi, leak_conductance, leak_threshold_mV, leak_softness_mV)
         J_K = -g_val * (psi - E_K)          # K⁺ into the vesicle
-        return psi, K_mM, E_K, back, J_H, J_K
+        if anion_conductance > 0:
+            A_mM = max(N_A, 1e-9) / NA / V * 1000
+            J_A = anion_conductance * (psi - RT_F * np.log(A_mM / anion_out_mM))
+        else:
+            A_mM, J_A = N_A / NA / V * 1000, 0.0
+        return psi, K_mM, E_K, back, J_pump, J_leak, J_K, J_A, A_mM
 
     def rhs(t, y):
-        Q, N, dpH = y
-        _, _, _, _, J_H, J_K = state(Q, N, dpH)
-        return [J_H, J_K, -J_H / NA / (soluble_beta(pH_start + dpH, buffer_mM / 1000, buffer_pKa) * V)]
+        Q, N, dpH, N_A, _ = y
+        _, _, _, _, J_pump, J_leak, J_K, J_A, _ = state(Q, N, dpH, N_A)
+        J_H = J_pump + J_leak
+        beta = soluble_beta(pH_start + dpH, buffer_mM / 1000, buffer_pKa)
+        return [J_H, J_K, -J_H / NA / (beta * V), J_A, J_pump]
 
     t = np.linspace(0, duration_s, n_points)
-    sol = solve_ivp(rhs, (0, duration_s), [0.0, N_start, 0.0], method="Radau", t_eval=t,
-                    rtol=1e-7, atol=[1e-6, max(N_start, 1.0) * 1e-9, 1e-10])
+    sol = solve_ivp(rhs, (0, duration_s), [0.0, N_start, 0.0, A_start, 0.0], method="Radau", t_eval=t,
+                    rtol=1e-7, atol=[1e-6, max(N_start, 1.0) * 1e-9, 1e-10, max(A_start, 1.0) * 1e-9, 1e-6])
     if not sol.success:
         raise RuntimeError(sol.message)
-    Q, N, dpH = sol.y
-    out = [state(*y) for y in sol.y.T]
-    psi, K_mM, E_K, back, J_H, J_K = (np.array(v) for v in zip(*out))
+    Q, N, dpH, N_A, Q_pumped = sol.y
+    out = [state(*y[:4]) for y in sol.y.T]
+    psi, K_mM, E_K, back, J_pump, J_leak, J_K, J_A, A_mM = (np.array(v) for v in zip(*out))
     return dict(time=t, psi_mV=psi, pH_in=pH_start + dpH, delta_pH=dpH, K_in_mM=K_mM,
-                K_ions=N, K_ions_start=N_start, H_pumped=Q, E_K_mV=E_K,
-                back_pressure_mV=back, pH_part_mV=-Z * dpH, J_H=J_H, J_K=J_K,
-                pump_fraction=J_H / pump_max if pump_max > 0 else np.zeros_like(t),
+                K_ions=N, K_ions_start=N_start, H_pumped=Q_pumped, H_net_in=Q, E_K_mV=E_K,
+                back_pressure_mV=back, pH_part_mV=-Z * dpH, J_H=J_pump, J_leak=J_leak, J_K=J_K,
+                J_anion=J_A, anion_in_mM=A_mM, anions_in=N_A - A_start,
+                pump_fraction=J_pump / pump_max if pump_max > 0 else np.zeros_like(t),
                 stop_mV=stop_mV, Z_mV=Z, **geo)
