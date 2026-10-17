@@ -209,9 +209,13 @@ show_leak_curve = st.sidebar.checkbox(
 
 # Helper function: soft-threshold leak
 def soft_threshold_leak(psi_mV, conductance, threshold_mV, softness_mV):
+    # The value at Δψ = 0 is subtracted, so the leak is exactly zero without a potential
+    # and changes smoothly through 0 mV. (Before, it jumped between −0.9 and +0.9 H⁺/s
+    # at 0 mV, which can make the solver stick to Δψ = 0.)
     abs_psi = np.abs(psi_mV)
     x = (abs_psi - threshold_mV) / softness_mV
-    excess = softness_mV * np.logaddexp(0, x)
+    x0 = -threshold_mV / softness_mV
+    excess = softness_mV * (np.logaddexp(0, x) - np.logaddexp(0, x0))
     return -np.sign(psi_mV) * conductance * excess
 
 # Geometry and capacitance
